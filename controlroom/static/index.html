@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TCM-5 · Mill Control Room</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%233fb950'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="frame">
+
+  <!-- ───────────────────────── header / pulpit masthead ──────────────────── -->
+  <header class="masthead panel" data-pid="PNL-00">
+    <div class="idblock">
+      <div class="idblock-tag">RTBDP · UNIT 07 · LINE 1</div>
+      <h1>TCM&#8209;5<span class="h1-sub">COLD TANDEM MILL</span></h1>
+      <div class="idblock-sub">REAL-TIME ANOMALY SURVEILLANCE</div>
+    </div>
+
+    <div class="bannerblock">
+      <div id="model-banner" class="model-banner">
+        <span class="mb-led" id="mb-led"></span>
+        <span class="mb-text" id="mb-text">AWAITING MODEL REGISTER…</span>
+      </div>
+      <div class="bannerblock-sub" id="mb-sub">scoring model · threshold drives every lamp on this board</div>
+    </div>
+
+    <div class="vitals">
+      <div class="vital">
+        <label>THROUGHPUT</label>
+        <b id="v-eps" class="num">—</b><u>ev/s</u>
+      </div>
+      <div class="vital">
+        <label>COILS DONE</label>
+        <b id="v-coils" class="num">—</b><u>total</u>
+      </div>
+      <div class="vital">
+        <label>UNSUP ANOM</label>
+        <b id="v-unsup" class="num">—</b><u>%</u>
+      </div>
+      <div class="vital">
+        <label>SINK FRESHNESS</label>
+        <b id="v-fresh" class="num">—</b><u id="v-fresh-u">s</u>
+      </div>
+      <div class="vital">
+        <label>LATENCY P95</label>
+        <b id="v-p95" class="num">—</b><u>ms</u>
+      </div>
+      <div id="status-pill" class="pill is-idle"><i></i><span id="status-text">CONNECTING</span></div>
+    </div>
+  </header>
+
+  <!-- ───────────────────────── mill train schematic ──────────────────────── -->
+  <section class="panel schematic" data-pid="PNL-01 · MILL TRAIN">
+    <div class="panel-head">
+      <span class="ph-title">MILL TRAIN — LIVE SCHEMATIC</span>
+      <span class="ph-legend">
+        ALARM RATE / 10 s OF STREAM TIME &nbsp;
+        <i class="dot dot-g"></i>&lt;2% &nbsp;<i class="dot dot-a"></i>&lt;15% &nbsp;<i class="dot dot-r"></i>&ge;15%
+      </span>
+    </div>
+    <svg id="mill" viewBox="0 0 1240 318" preserveAspectRatio="xMidYMid meet" aria-label="Tandem mill schematic"></svg>
+  </section>
+
+  <!-- ───────────────────────── lower deck ────────────────────────────────── -->
+  <main class="deck">
+
+    <section class="panel ticker-panel" data-pid="PNL-02 · ALARM LOG">
+      <div class="panel-head">
+        <span class="ph-title">LIVE ANOMALY TICKER</span>
+        <span class="ph-legend" id="ticker-meta">flagged &ge; thr</span>
+      </div>
+      <ol id="ticker" class="ticker"><li class="ticker-empty" id="ticker-empty">no flagged events yet — board is clean</li></ol>
+    </section>
+
+    <section class="panel model-panel" data-pid="PNL-03 · MODEL DECK">
+      <div class="panel-head">
+        <span class="ph-title">SCORING MODEL — HOT-SWAP DECK</span>
+        <span class="ph-legend" id="model-meta"></span>
+      </div>
+
+      <div class="model-kpis" id="model-kpis">
+        <div class="mk"><label>F1</label><b id="mk-f1" class="num">—</b></div>
+        <div class="mk"><label>PR-AUC</label><b id="mk-prauc" class="num">—</b></div>
+        <div class="mk"><label>PRECISION</label><b id="mk-prec" class="num">—</b></div>
+        <div class="mk"><label>RECALL</label><b id="mk-rec" class="num">—</b></div>
+      </div>
+
+      <div id="hotswap" class="hotswap is-sync">
+        <div class="hs-lamp"></div>
+        <div class="hs-main">
+          <div class="hs-line" id="hs-line">model register empty</div>
+          <div class="hs-sub" id="hs-sub">live scores vs registered version</div>
+        </div>
+        <div class="hs-vers"><span id="hs-live">v–</span><span class="hs-arrow">▸</span><span id="hs-latest">v–</span></div>
+      </div>
+
+      <div class="recalls" id="recalls">
+        <div class="recall-row" data-fam="electric">
+          <label>ELECTRIC</label>
+          <div class="recall-track"><div class="recall-ghost"></div><div class="recall-fill"></div></div>
+          <b class="recall-val num">—</b>
+        </div>
+        <div class="recall-row" data-fam="bearing">
+          <label>BEARING</label>
+          <div class="recall-track"><div class="recall-ghost"></div><div class="recall-fill"></div></div>
+          <b class="recall-val num">—</b>
+        </div>
+        <div class="recall-row" data-fam="workroll">
+          <label>WORK ROLL</label>
+          <div class="recall-track"><div class="recall-ghost"></div><div class="recall-fill"></div></div>
+          <b class="recall-val num">—</b>
+        </div>
+        <div class="recall-row" data-fam="reduction">
+          <label>REDUCTION</label>
+          <div class="recall-track"><div class="recall-ghost"></div><div class="recall-fill"></div></div>
+          <b class="recall-val num">—</b>
+        </div>
+        <div class="recalls-cap">HELD-OUT RECALL BY FAULT FAMILY · <span class="ghost-key">▏</span> previous version</div>
+      </div>
+
+      <div class="retrain-row">
+        <button id="retrain-btn" type="button"><span class="rb-label">TRAIN MODEL</span></button>
+        <div class="retrain-side">
+          <div id="retrain-status" class="retrain-status">trains on the coils streamed so far, then hot-swaps into Flink — no restart</div>
+          <div id="policy-line" class="policy-line">auto-retrain policy: checking…</div>
+        </div>
+      </div>
+      <pre id="retrain-out" class="retrain-out" hidden></pre>
+    </section>
+
+  </main>
+
+  <!-- ───────────────────────── coils to inspect ──────────────────────────── -->
+  <section class="panel inspect-panel" data-pid="PNL-04 · INSPECTION QUEUE">
+    <div class="panel-head">
+      <span class="ph-title">COILS TO INSPECT — MODEL + 2-OF-3 ENSEMBLE</span>
+      <span class="ph-legend" id="inspect-meta">flagged by model or ensemble · click a row to drill in</span>
+    </div>
+    <div class="inspect-wrap">
+      <table class="inspect" id="inspect">
+        <thead><tr>
+          <th data-k="coil_id">COIL</th>
+          <th data-k="predicted_fault">PREDICTED FAULT</th>
+          <th data-k="flagged_by">FLAGGED BY</th>
+          <th data-k="confidence" class="sortdir desc">CONFIDENCE</th>
+          <th data-k="worst_stand">WORST STAND</th>
+          <th data-k="first_stand">FIRST FLAGGED</th>
+          <th data-k="stands_alarmed">STANDS</th>
+          <th data-k="model_version">MODEL</th>
+        </tr></thead>
+        <tbody id="inspect-body"><tr class="inspect-empty"><td colspan="8">no flagged coils yet — line is clean</td></tr></tbody>
+      </table>
+    </div>
+    <div id="inspect-detail" class="inspect-detail" hidden></div>
+  </section>
+
+  <footer class="strip-footer">
+    <span class="f-id">TCM-5 CONTROL ROOM · read-only sink view · SSE /stream</span>
+    <span class="f-links">
+      <a href="http://localhost:33000" target="_blank" rel="noopener">grafana&nbsp;:33000</a>
+      <a href="http://localhost:38081" target="_blank" rel="noopener">flink&nbsp;:38081</a>
+      <a href="http://localhost:38000" target="_blank" rel="noopener">retrain&nbsp;:38000</a>
+    </span>
+  </footer>
+
+</div>
+
+<script src="/static/rxjs.umd.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

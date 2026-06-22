@@ -1,0 +1,15 @@
+# Grafana dashboard provisioning — loads every dashboard JSON under the
+# provisioning path. We ship exactly ONE board (tcm5.json).
+# https://grafana.com/docs/grafana/latest/administration/provisioning/#dashboards
+apiVersion: 1
+
+providers:
+- name: 'default'
+  orgId: 1
+  folder: ''
+  type: 'file'
+  updateIntervalSeconds: 10
+  allowUiUpdates: true
+  options:
+    path: '/etc/grafana/provisioning'  # path inside the grafana container (mounted from ./grafana)
+    foldersFromFilesStructure: false

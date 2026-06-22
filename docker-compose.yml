@@ -1,0 +1,239 @@
+#
+# TCM-5 real-time anomaly detection — full stack.
+#
+#   `docker compose up -d` starts the whole pipeline (.env sets COMPOSE_PROFILES=processor,producer):
+#     broker (Kafka KRaft) · kafka-ui · postgres · grafana · flink JM+TM · retrain ·
+#     controlroom · processor (submits the PyFlink job) · producer (replays coils to Kafka)
+#   `docker compose down`     stops it (state kept in named volumes)
+#   `docker compose down -v`  stops AND erases all data + the trained model (true cold start next up)
+#
+# Python services (processor/retrain/producer) build with context '.' so the
+# single data contract shared/contract.py is COPYed into each image.
+#
+
+services:
+
+  broker:
+    image: confluentinc/cp-kafka:7.9.0
+    container_name: '${COMPOSE_PROJECT_NAME:-tcm5}-broker'
+    restart: unless-stopped
+    ports:
+      - '${PORT_BROKER:-39092}:29092'
+    volumes:
+      - broker-data:/var/lib/kafka/data
+    environment:
+      CLUSTER_ID: '${CLUSTER_ID:-YzUyZWRlYzBhNDkwNDNmNG}'
+      KAFKA_NODE_ID: '1'
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@broker:9093'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LISTENERS: 'INTERNAL://broker:9092,EXTERNAL://broker:29092,CONTROLLER://broker:9093'
+      KAFKA_ADVERTISED_LISTENERS: 'INTERNAL://broker:9092,EXTERNAL://localhost:${PORT_BROKER:-39092}'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'INTERNAL'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1'
+      KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: '1'
+      KAFKA_LOG4J_ROOT_LOGLEVEL: 'WARN'
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: '${COMPOSE_PROJECT_NAME:-tcm5}-kafka-ui'
+    restart: unless-stopped
+    ports:
+      - '${PORT_KAFKA_UI:-38080}:8080'
+    depends_on:
+      - broker
+    environment:
+      KAFKA_CLUSTERS_0_NAME: 'tcm5'
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: 'broker:9092'
+      LOGGING_LEVEL_ROOT: 'ERROR'
+      LOGGING_LEVEL_COM_PROVECTUS: 'ERROR'
+
+  postgres:
+    image: postgres:16.2-alpine3.19
+    container_name: '${COMPOSE_PROJECT_NAME:-tcm5}-postgres'
+    restart: unless-stopped
+    ports:
+      - '${PORT_POSTGRES:-35432}:5432'
+    volumes:
+      - ./postgres:/docker-entrypoint-initdb.d
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: 'db'
+      POSTGRES_USER: '${USERID:-user}'
+      POSTGRES_PASSWORD: '${USERPWD:-user}'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${USERID:-user} -d db']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  grafana:
+    image: grafana/grafana-oss:11.6.1
+    container_name: '${COMPOSE_PROJECT_NAME:-tcm5}-grafana'
+    restart: unless-stopped
+    ports:
+      - '${PORT_GRAFANA:-33000}:3000'
+    depends_on:
+      - postgres
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana:/etc/grafana/provisioning:Z
+    environment:
+      GF_SECURITY_ADMIN_USER: '${USERID:-user}'
+      GF_SECURITY_ADMIN_PASSWORD: '${USERPWD:-user}'
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: '/etc/grafana/provisioning/dashboards/tcm5.json'
+      GF_USERS_DEFAULT_THEME: 'dark'
+      GF_LOG_LEVEL: 'WARN'
+      DB_ADDR: 'postgres:5432'
+      DB_NAME: 'db'
+      DB_USERID: '${USERID:-user}'
+      DB_USERPWD: '${USERPWD:-user}'
+
+  #
+  # Flink cluster: one JobManager + one TaskManager. The PyFlink UDF executes on the
+  # TaskManager, so the model artifact volume is mounted there (read) and into the
+  # retrain service (write).
+  #
+  flink-jobmanager:
+    build:
+      context: .
+      dockerfile: flink/Dockerfile
+      args:
+        FLINK_IMAGE: ${FLINK_IMAGE:-fracorco/pyflink:1.18.1-scala_2.12-java11}
+    image: '${COMPOSE_PROJECT_NAME:-tcm5}-flink:1.18.1'
+    container_name: '${COMPOSE_PROJECT_NAME:-tcm5}-flink-jobmanager'
+    restart: unless-stopped
+    ports:
+      - '${PORT_FLINK:-38081}:8081'
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+
+  flink-taskmanager:
+    build:
+      context: .
+      dockerfile: flink/Dockerfile
+      args:
+        FLINK_IMAGE: ${FLINK_IMAGE:-fracorco/pyflink:1.18.1-scala_2.12-java11}
+    image: '${COMPOSE_PROJECT_NAME:-tcm5}-flink:1.18.1'
+    container_name: '${COMPOSE_PROJECT_NAME:-tcm5}-flink-taskmanager'
+    restart: unless-stopped
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    volumes:
+      - models-data:/models                    # UDF reads /models/model.pkl here
+    environment:
+      MODEL_PATH: '/models/model.pkl'
+      MODEL_META_PATH: '/models/model.meta'
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: ${FLINK_TASK_SLOTS:-4}
+        parallelism.default: ${FLINK_DEFAULT_PARALLELISM:-1}
+        taskmanager.memory.process.size: 2560m
+
+  #
+  # PyFlink processor submission container. Submits the job to the Flink cluster.
+  #
+  processor:
+    build:
+      context: .
+      dockerfile: processor/Dockerfile
+      args:
+        FLINK_IMAGE: ${FLINK_IMAGE:-fracorco/pyflink:1.18.1-scala_2.12-java11}
+    image: '${COMPOSE_PROJECT_NAME:-tcm5}-processor:latest'
+    container_name: '${COMPOSE_PROJECT_NAME:-tcm5}-processor'
+    profiles: ['processor']
+    depends_on:
+      - flink-jobmanager
+      - broker
+      - postgres
+    # models mounted read-only for a presence check: on cold start the submitter
+    # launches immediately with no model (events persist unscored until Train);
+    # set REQUIRE_MODEL=1 to instead block until an artifact exists.
+    volumes:
+      - models-data:/models:ro
+    environment:
+      PROCESSOR_JOBMANAGER: 'flink-jobmanager:8081'
+      PROCESSOR_IMPLEMENTATION: 'processor.py'
+      PROCESSOR_ARGS: '--bootstrap-servers broker:9092 --topic ${TOPIC:-tcm5_readings} --db-url jdbc:postgresql://postgres:5432/db --db-username ${USERID:-user} --db-password ${USERPWD:-user} --threshold ${KPI_THRESHOLD:-0.85}'
+
+  #
+  # Producer: replays the coils as a per-stand Kafka stream.
+  #
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    image: '${COMPOSE_PROJECT_NAME:-tcm5}-producer:latest'
+    container_name: '${COMPOSE_PROJECT_NAME:-tcm5}-producer'
+    profiles: ['producer']
+    depends_on:
+      - broker
+    volumes:
+      # read-write so the producer can materialize data/tcm5_merged.parquet on a
+      # clean checkout where only the raw CSVs are present
+      - ./data:/data
+    command: >
+      python3 producer.py
+      --bootstrap-servers broker:9092
+      --topic ${TOPIC:-tcm5_readings}
+      --data-dir /data
+      --speedup ${PRODUCER_SPEEDUP:-30}
+      --max-coils ${PRODUCER_MAX_COILS:-0}
+      ${PRODUCER_EXTRA:-}
+
+  #
+  # Retrain sidecar (FastAPI). Always up; POST /retrain trains on streamed data,
+  # evaluates on the fixed held-out set, hot-swaps the model artifact atomically.
+  #
+  retrain:
+    build:
+      context: .
+      dockerfile: retrain/Dockerfile
+    image: '${COMPOSE_PROJECT_NAME:-tcm5}-retrain:latest'
+    container_name: '${COMPOSE_PROJECT_NAME:-tcm5}-retrain'
+    restart: unless-stopped
+    ports:
+      - '${PORT_RETRAIN:-38000}:8000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - models-data:/models
+    environment:
+      DB_DSN: 'host=postgres port=5432 dbname=db user=${USERID:-user} password=${USERPWD:-user}'
+      MODEL_DIR: '/models'
+      RETRAIN_AUTO: '${RETRAIN_AUTO:-1}'
+
+  #
+  # Control room (FastAPI + SSE). Read-only live "mill control room" web UI on top of
+  # Postgres — the operational complement to the one analytical Grafana dashboard.
+  #
+  controlroom:
+    build:
+      context: .
+      dockerfile: controlroom/Dockerfile
+    image: '${COMPOSE_PROJECT_NAME:-tcm5}-controlroom:latest'
+    container_name: '${COMPOSE_PROJECT_NAME:-tcm5}-controlroom'
+    restart: unless-stopped
+    ports:
+      - '${PORT_CONTROLROOM:-38500}:8000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      retrain:
+        condition: service_started
+    environment:
+      DB_DSN: 'host=postgres port=5432 dbname=db user=${USERID:-user} password=${USERPWD:-user}'
+      RETRAIN_URL: 'http://retrain:8000'
+
+volumes:
+  broker-data:
+  postgres-data:
+  grafana-data:
+  models-data:

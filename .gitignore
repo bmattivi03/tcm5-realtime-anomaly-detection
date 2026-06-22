@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated at runtime (the producer rebuilds the merged parquet from the CSVs)
+data/*.parquet
+
+# OS
+.DS_Store

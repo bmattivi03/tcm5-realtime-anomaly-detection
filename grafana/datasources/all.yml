@@ -1,0 +1,22 @@
+# Grafana datasource provisioning — single Postgres datasource (uid 'postgres').
+# https://grafana.com/docs/grafana/latest/administration/provisioning/#data-sources
+apiVersion: 1
+
+datasources:
+- name: 'postgres'
+  uid: 'postgres'
+  type: 'postgres'
+  access: 'proxy'
+  orgId: 1
+  url: '${DB_ADDR}'
+  user: '${DB_USERID}'
+  basicAuth: false
+  isDefault: true
+  readOnly: false
+  jsonData:
+    database: '${DB_NAME}'
+    postgresVersion: 1600
+    sslmode: 'disable'
+    timescaledb: false
+  secureJsonData:
+    password: '${DB_USERPWD}'

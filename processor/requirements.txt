@@ -1,0 +1,10 @@
+# apache-flink 1.18.1 + numpy/pandas/pyarrow are already in the base Flink image.
+# numpy/pandas are pinned to the image versions so the model pickle (written by the
+# retrain sidecar at the same versions) loads cleanly; scikit-learn is the only real add.
+confluent-kafka==2.3.0
+numpy==1.24.4
+pandas==2.2.2
+scikit-learn==1.3.2
+scipy==1.11.4
+joblib==1.3.2
+threadpoolctl==3.2.0
