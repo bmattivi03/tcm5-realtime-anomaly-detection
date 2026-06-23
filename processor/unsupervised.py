@@ -1,33 +1,21 @@
-"""
-Unsupervised, model-free, in-stream anomaly detectors — executed on the Flink
-TaskManager as vectorized pandas UDFs, alongside the supervised model UDFs.
+"""Model-free in-stream anomaly detectors, run as pandas UDFs on the Flink TaskManager.
 
-Three detectors, each from a different family of the time-series anomaly taxonomy,
-each keeping streaming state KEYED PER STAND (stands run at very different force /
-torque regimes, so one global model would be meaningless) and each emitting a
-STANDARDIZED score with a FIXED cutoff so a clean 2-of-3 majority vote can be
-computed downstream in SQL:
+Three detectors, state keyed per stand (stands run at different force/torque regimes, so
+one global model is meaningless), each emitting a standardized score with a fixed cutoff so
+a 2-of-3 majority vote can run downstream in SQL:
 
-  u_maha  distribution   Mahalanobis D² = (x-µ)ᵀ Σ⁻¹ (x-µ) over EWMA mean/cov.
-                         Trigger D² > 23.2  (χ²₀.₉₉, 10 dof) — the tail rule.
-  u_spc   control chart  max_i |z_i| over the per-feature EWMA mean/std.
-                         Trigger > 3        (the 3σ rule).
-  u_knn   distance       standardized mean distance to the k=5 nearest neighbours
-                         in a rolling buffer of recent z-scored coils.
-                         Trigger > 3.
+  u_maha  Mahalanobis D² over EWMA mean/cov.   trigger D² > 23.2 (chi-square 0.99, 10 dof)
+  u_spc   max per-feature |z| over EWMA mean/std.  trigger > 3 (3 sigma)
+  u_knn   standardized mean distance to k=5 nearest neighbours in a rolling z-scored buffer.  trigger > 3
 
-  u_votes  = 1{u_maha>23.2} + 1{u_spc>3} + 1{u_knn>3}
-  u_anomaly = u_votes >= 2          (computed in the Flink SQL, see processor.py)
+  u_votes / u_anomaly (votes >= 2) are computed in the Flink SQL, see processor.py.
 
-These need NO trained model, so they score from the very first coil — they are the
-live detector during the cold-start window before the supervised model is trained,
-and a model-free second opinion afterwards. They run on the 10 PROCESS signals only
-(measured + tensions), never the product set-points (thickness/width/ys) or `stand`,
-so a different coil spec is not mistaken for a process fault.
+No trained model, so they score from the first coil: the live detector during cold-start,
+a second opinion afterwards. They watch only the 10 process signals (measured + tensions),
+never the product set-points or `stand`, so a different coil spec is not read as a fault.
 
-State is module-global per stand (parallelism is 1, same pattern as model_udf's model
-cache): adaptive (EWMA forgetting), not checkpointed (re-warms on restart), and gated
-by a warmup so it never triggers before it has learnt the normal envelope.
+Per-stand state is module-global (parallelism 1), EWMA-adaptive, not checkpointed (re-warms
+on restart), and gated by a warmup so it can't trigger before it has the normal envelope.
 """
 
 import numpy as np
@@ -65,8 +53,7 @@ def _blank():
 
 
 def _update(st, Xs):
-    """Batched exponentially-weighted update of the per-stand mean + covariance, and
-    append the z-scored batch rows to the kNN buffer."""
+    """EWMA update of per-stand mean + covariance; append z-scored rows to the kNN buffer."""
     m = len(Xs)
     bmean = Xs.mean(axis=0)
     if st["n"] == 0:
@@ -86,8 +73,8 @@ def _update(st, Xs):
 
 
 def score_batch(cols):
-    """cols: list of FEATURES-ordered arrays/Series (the 16 model features). Returns the
-    memoized (u_maha, u_spc, u_knn) for this batch — computed once, like model_udf."""
+    """cols: FEATURES-ordered arrays (16 features). Returns memoized (u_maha, u_spc, u_knn),
+    computed once per batch (memo keyed by batch content, like model_udf)."""
     first = np.asarray(cols[0])
     key = (len(first), hash(tuple(np.asarray(c).tobytes() for c in cols)))
     if _memo["key"] == key and _memo["u_maha"] is not None:
@@ -109,17 +96,17 @@ def score_batch(cols):
         if st["n"] >= WARMUP:
             std = np.sqrt(np.maximum(np.diag(st["cov"]), 1e-12))
             d = Xs - st["mean"]
-            # distribution: Mahalanobis D²
+            # Mahalanobis D²
             cov_r = st["cov"] + EPS * np.eye(P)
             try:
                 inv = np.linalg.inv(cov_r)
             except np.linalg.LinAlgError:
                 inv = np.linalg.pinv(cov_r)
             u_maha[mask] = np.einsum("ij,jk,ik->i", d, inv, d)
-            # control chart: worst per-feature z
+            # SPC: worst per-feature z
             z = d / std
             u_spc[mask] = np.abs(z).max(axis=1)
-            # distance: standardized kNN distance to the rolling buffer
+            # standardized kNN distance to the rolling buffer
             buf = st["buf"]
             if len(buf) >= KNN_MIN:
                 dist = np.sqrt(((z[:, None, :] - buf[None, :, :]) ** 2).sum(axis=2))
@@ -127,7 +114,7 @@ def score_batch(cols):
                 knn_d = np.partition(dist, k - 1, axis=1)[:, :k].mean(axis=1)
                 dstd = np.sqrt(max(st["dvar"], 1e-9))
                 u_knn[mask] = (knn_d - st["dmean"]) / dstd
-                # EWMA-update the kNN distance distribution (for next standardization)
+                # EWMA the kNN-distance mean/var so the next batch can standardize against it
                 beta = 1.0 - (1.0 - ALPHA) ** len(knn_d)
                 bm = knn_d.mean()
                 ddiff = bm - st["dmean"]
@@ -141,7 +128,7 @@ def score_batch(cols):
     return _memo
 
 
-# --- PyFlink UDF wrappers (optional import so the core stays unit-testable offline) ---
+# --- PyFlink UDF wrappers (optional import: core stays usable without pyflink) ---
 try:
     import pandas as pd
     from pyflink.table import DataTypes
@@ -158,6 +145,6 @@ try:
     @udf(result_type=DataTypes.DOUBLE(), func_type="pandas")
     def u_knn(*cols):
         return pd.Series(score_batch(list(cols))["u_knn"])
-except ImportError:                      # offline (no pyflink): core functions still usable
+except ImportError:                      # no pyflink: core functions still usable
     pd = None
     u_maha = u_spc = u_knn = None

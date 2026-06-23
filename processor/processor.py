@@ -1,24 +1,12 @@
 #!/usr/bin/env python
-"""
-PyFlink Table API processor — scores the per-stand Kafka stream with the ML model
-and computes event-time KPI windows, writing both grains to PostgreSQL.
+"""PyFlink Table API processor: score the per-stand Kafka stream and compute event-time
+KPI windows, writing both grains to PostgreSQL.
 
-Design:
-  * Kafka source with a real event-time attribute `ts` (TO_TIMESTAMP_LTZ + WATERMARK),
-    read from 'earliest-offset' with table.exec.source.idle-timeout so the watermark
-    advances and the windows actually fire.
-  * A single shared `scored` view applies the model UDFs; with
-    table.optimizer.reuse-optimize-block-with-digest-enabled the planner reuses the
-    scored sub-plan across both sinks, so the model scores each event ONCE (without
-    the option each sink gets its own PythonCalc and the model runs twice per event —
-    verified via StatementSet.explain()).
-  * Checkpointing every 10 s: offsets commit on checkpoint (consumer lag is visible in
-    kafka-ui) and the default restart strategy flips to fixed-delay, so a transient
-    failure (Postgres blip, TaskManager restart) recovers instead of killing the job.
-    The sinks tolerate the resulting at-least-once replay: scored_events is deduped by
-    the readers, kpi_windows upserts on its (window_start, window_end) key.
-  * `ts` flows through the view unmodified so TUMBLE(... DESCRIPTOR(ts) ...) is accepted.
-  * Session timezone = UTC + Postgres TIMESTAMP, so Grafana "last N min" filters match.
+Source needs `ts` as a real time-attribute + idle-timeout or the watermark never advances
+and windows never fire. One shared `scored` view + reuse-optimize-block makes the model run
+once per event, not once per sink (check with StatementSet.explain()). Sinks are at-least-once on restart; readers dedup
+scored_events and kpi_windows upserts on (window_start, window_end). Keep session tz = UTC
+and Postgres TIMESTAMP or Grafana "last N min" filters drift.
 """
 
 import os
@@ -45,10 +33,9 @@ def connector(args, table):
 
 
 def wait_for_model(path, timeout_s=120, require=False):
-    """Cold-start by default: submit immediately even with no model. The UDF scores 0 /
-    version 0 until the first model.pkl lands, so the stream still persists raw features +
-    labels to Postgres — that accumulated data is what the dashboard "Train" button learns
-    from. Set REQUIRE_MODEL=1 to keep the old behaviour (block until an artifact exists)."""
+    """Cold-start by default: submit with no model. UDF scores 0 / version 0 until the first
+    model.pkl lands, but events still persist (raw features + labels) so the Train button has
+    data to learn from. REQUIRE_MODEL=1 blocks until an artifact exists instead."""
     if os.path.exists(path):
         print(f"Found model artifact {path}", flush=True)
         return
@@ -92,10 +79,9 @@ def main():
             .set_integer("rest.port", args.ui_port)
             .set_integer("table.exec.source.idle-timeout", 1000)
             .set_string("table.local-time-zone", "UTC")
-            # reuse the scored sub-plan across both sinks: ONE PythonCalc, the model
-            # loads + scores once per event (see module docstring)
+            # reuse scored sub-plan across sinks -> one PythonCalc, model scores once/event
             .set_string("table.optimizer.reuse-optimize-block-with-digest-enabled", "true")
-            # fault tolerance: checkpoint -> offsets commit + fixed-delay auto-restart
+            # checkpoint -> commits offsets + arms fixed-delay restart (recover, don't die)
             .set_string("execution.checkpointing.interval", "10 s")
             .set_string("execution.checkpointing.mode", "EXACTLY_ONCE")
             .set_string("restart-strategy.type", "fixed-delay")
@@ -115,13 +101,13 @@ def main():
                      ("p_workroll", model_udf.p_workroll),
                      ("p_reduction", model_udf.p_reduction),
                      ("model_version", model_udf.model_version),
-                     # model-free, in-stream unsupervised detectors (2-of-3 vote)
+                     # model-free unsupervised detectors (2-of-3 vote)
                      ("u_maha", unsupervised.u_maha),
                      ("u_spc", unsupervised.u_spc),
                      ("u_knn", unsupervised.u_knn)]:
         tenv.create_temporary_system_function(name, fn)
 
-    # ---- Kafka source: one per-stand reading; `ts` is a real time attribute ----
+    # ---- Kafka source: per-stand reading; `ts` must stay a real time-attribute ----
     tenv.execute_sql(f"""
         CREATE TABLE `readings` (
             `coil_id` BIGINT,

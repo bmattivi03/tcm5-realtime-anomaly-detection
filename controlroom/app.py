@@ -1,21 +1,9 @@
 #!/usr/bin/env python
-"""
-TCM-5 control room — the live *operational* view of the mill.
+"""TCM-5 control room: operational view of the mill (Grafana stays the analytical one).
 
-Grafana stays the analytical dashboard; this page is the operational view:
-an animated tandem-mill schematic, alarm ticker and hot-swap choreography,
-all fed by one SSE stream.
-
-One background task polls Postgres (READ-ONLY) about once per second, builds a
-single JSON snapshot and fans it out to every connected SSE client through
-per-client queues, so the DB load is O(1) in the number of viewers.
-
-  GET  /               the control-room page (static/index.html)
-  GET  /api/snapshot   latest snapshot JSON
-  GET  /stream         text/event-stream, named event "snapshot"
-  GET  /api/coil/{id}  per-stand latest rows for one coil (ticker drill-down)
-  POST /api/retrain    proxy to the retrain sidecar (avoids browser CORS)
-  GET  /api/policy     proxy to the sidecar's auto-retrain policy, if present
+One background task polls Postgres read-only ~1/s, builds one JSON snapshot, and fans it out to every
+SSE client via per-client queues, so DB load is O(1) in viewers. /api/retrain and /api/policy proxy the
+retrain sidecar to dodge browser CORS.
 """
 
 import asyncio
@@ -46,8 +34,8 @@ FAMILIES = ("electric", "bearing", "workroll", "reduction")
 # Unsupervised detector cutoffs — keep in sync with processor/unsupervised.py.
 MAHA_T, SPC_T, KNN_T = 23.21, 3.0, 3.0
 
-_conn = None              # persistent connection, used only by the poller thread
-_has_ingested = None      # tri-state: None = unknown, re-check info_schema
+_conn = None              # poller thread's persistent connection
+_has_ingested = None      # tri-state: None = unknown, re-check info_schema for ingested_at
 _ing_checked_at = 0.0
 _latest: "dict | None" = None
 _clients: "set[asyncio.Queue]" = set()
@@ -66,9 +54,9 @@ STANDS_SQL = (f"SELECT stand, count(*), avg((anomaly_score >= %s)::int), "
 TICKER_SQL = ("SELECT reading_id, ts, coil_id, stand, anomaly_score, "
               "p_electric, p_bearing, p_workroll, p_reduction "
               "FROM scored_events WHERE anomaly_score >= %s ORDER BY reading_id DESC LIMIT 25")
-# Coils to inspect: flagged by the supervised model (score >= threshold) OR the
-# model-free 2-of-3 ensemble (u_anomaly). Predicted fault = argmax family prob at the
-# worst stand (a prediction, never ground truth; only meaningful once a model exists).
+# Inspect = coils flagged by the supervised model (score >= threshold) OR the model-free 2-of-3
+# ensemble (u_anomaly). predicted_fault = argmax family prob at the worst stand; a prediction, never
+# ground truth, and only meaningful once a model exists.
 INSPECT_SQL = (
     "WITH ev AS ("
     "  SELECT DISTINCT ON (coil_id, stand) coil_id, stand, anomaly_score,"
@@ -109,7 +97,7 @@ COIL_SQL = ("SELECT DISTINCT ON (coil_id, stand) stand, ts, force, torque, gap, 
 
 
 def _connect(retries=10):
-    """Reconnect-with-backoff, same shape as retrain.py; autocommit = plain read-only SELECTs."""
+    """Connect with backoff. autocommit since we only run read-only SELECTs."""
     last = None
     for _ in range(retries):
         try:
@@ -151,7 +139,7 @@ def build_snapshot(conn) -> dict:
         cur.execute("SELECT max(ts) FROM scored_events")
         anchor = cur.fetchone()[0]
 
-        # Per-stand state over the last 10 s of STREAM time (anchored to max(ts), not now()).
+        # last 10 s of stream time, anchored to max(ts) not now() (replay/lag tolerant).
         stands = {s: {"stand": s, "events": 0, "alarm_rate": 0.0, "p_electric": None,
                       "p_bearing": None, "p_workroll": None, "p_reduction": None,
                       "dominant": None, "force": None, "work_roll_mileage": None,
@@ -177,7 +165,6 @@ def build_snapshot(conn) -> dict:
                    "stand": int(r[3]), "anomaly_score": _f(r[4]),
                    "family": _argmax_family([_f(v) for v in r[5:9]])} for r in cur.fetchall()]
 
-        # Coils to inspect: flagged by the model OR the 2-of-3 ensemble.
         inspect = []
         if anchor is not None:
             cur.execute(INSPECT_SQL, {"anchor": anchor, "thr": threshold})
@@ -211,7 +198,7 @@ def build_snapshot(conn) -> dict:
             kpi = {"window_start": _iso(row[0]), "window_end": _iso(row[1]), "coils": int(row[2]),
                    "events": int(row[3]), "anomalies": int(row[4]), "anomaly_rate": _f(row[5])}
 
-        # Latency only if the ingested_at column exists (it is being added; degrade to nulls).
+        # latency only if the ingested_at column exists; degrade to nulls otherwise.
         p50 = p95 = None
         if _has_ingested is None or (_has_ingested is False and time.time() - _ing_checked_at > 60):
             cur.execute("SELECT count(*) FROM information_schema.columns "
@@ -389,8 +376,7 @@ async def policy():
         status, body = await loop.run_in_executor(None, _proxy, "GET", "/policy", 5.0)
         data = json.loads(body)
         if status == 200 and isinstance(data, dict):
-            # the sidecar nests last_check/last_reason under "state"; flatten them to
-            # the top level so the control-room policy line can read them directly
+            # sidecar nests last_check/last_reason under "state"; flatten to top level for the client.
             state = data.get("state", {})
             return {"available": True, "enabled": data.get("enabled"),
                     "config": data.get("config"), **state}

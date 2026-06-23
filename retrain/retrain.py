@@ -1,17 +1,9 @@
 #!/usr/bin/env python
-"""
-Retrain sidecar core — trains a new model on the accumulated streamed data and
-hot-swaps it with no processor restart.
+"""Retrain sidecar: train a new model on accumulated streamed data, hot-swap with no processor restart.
 
-It pulls (deduped) features + ground-truth labels straight from scored_events,
-EXCLUDING the fixed held-out coils (so there is no leakage), retrains the per-family
-model, evaluates on the SAME held-out set every time (comparable across versions),
-writes the artifact atomically (metadata before model, os.replace) and appends a
-model_versions row. The Flink UDF notices the new model.pkl mtime and reloads it.
-
-Because the stream delivers files 1-2 (reduction only) first and 3-6 (all families)
-later, a retrain run after the full stream has the examples the bootstrap never saw,
-so electric/bearing/workroll recall genuinely climbs — the honest flywheel.
+Pulls deduped features + labels from scored_events, EXCLUDING the frozen held-out coils (no leakage),
+trains the per-family model, evaluates on the same held-out set every time (comparable across versions),
+writes the artifact atomically, and appends a model_versions row. The Flink UDF reloads on model.pkl mtime.
 
 Runnable as a one-shot CLI (`python retrain.py`) or via the FastAPI app (POST /retrain).
 """
@@ -51,7 +43,7 @@ def _connect(retries=10):
 
 
 def load_streamed(holdout_ids: set) -> pd.DataFrame:
-    """Deduped per-(coil,stand) features + labels from the stream, minus held-out coils."""
+    """Deduped per-(coil,stand) features + labels, minus held-out coils."""
     df = _load_all_streamed()
     if df.empty:
         return df
@@ -59,7 +51,7 @@ def load_streamed(holdout_ids: set) -> pd.DataFrame:
 
 
 def _load_all_streamed() -> pd.DataFrame:
-    """All deduped per-(coil,stand) features+labels from the stream (no holdout filter)."""
+    """All deduped per-(coil,stand) features+labels (no holdout filter)."""
     cols = ", ".join(contract.FEATURES + contract.LABEL_KEYS)
     sql = (f"SELECT DISTINCT ON (coil_id, stand) coil_id, {cols} "
            f"FROM scored_events ORDER BY coil_id, stand, reading_id DESC")
@@ -70,15 +62,13 @@ def _load_all_streamed() -> pd.DataFrame:
         conn.close()
 
 
-# Minimum positive COILS per fault family before the held-out set is FROZEN. The held-out
-# per-family recall is meaningless if a family has ~no examples in it, and a too-early freeze
-# (the very first TRAIN at ~400 coils) locks in a holdout with 0 rare-family coils -> a
-# permanent 0% recall for electric/bearing/workroll even though the model is fine.
+# min positive coils per family before freezing the holdout. freezing too early (first TRAIN at
+# ~400 coils) locks in 0 rare-family coils -> permanent 0% recall for electric/bearing/workroll.
 MIN_HOLDOUT_PER_FAMILY = 25
 
 
 def _carve_holdout(df: pd.DataFrame) -> dict:
-    """Stratified (by primary fault family), coil-level 15% held-out split of df."""
+    """Coil-level 15% held-out split, stratified by primary fault family."""
     fam = df.groupby("coil_id")[contract.LABEL_KEYS].any()
 
     def primary(r):
@@ -91,7 +81,7 @@ def _carve_holdout(df: pd.DataFrame) -> dict:
     coil_ids = fam.index.to_numpy()
     try:
         _, hold = train_test_split(coil_ids, test_size=0.15, random_state=42, stratify=stratum)
-    except ValueError:                       # a stratum too small to split on
+    except ValueError:                       # stratum too small to stratify
         _, hold = train_test_split(coil_ids, test_size=0.15, random_state=42)
     hold_ids = sorted(int(c) for c in hold)
     hold_df = df[df.coil_id.isin(set(hold_ids))]
@@ -102,13 +92,11 @@ def _carve_holdout(df: pd.DataFrame) -> dict:
 
 
 def get_holdout():
-    """Return ``(holdout_dict, frozen)``.
+    """Return (holdout_dict, frozen).
 
-    Cold start: the held-out set is carved from the streamed data and
-    reused across versions for comparable metrics — BUT it is only FROZEN to disk once every
-    fault family has >= MIN_HOLDOUT_PER_FAMILY positive coils, so it is representative. Before
-    that it is re-carved each TRAIN (a temporary, not-yet-comparable holdout) so an early
-    train still gets evaluated without locking in a degenerate 0%-recall holdout.
+    Carved from the stream and frozen to disk only once every family has >= MIN_HOLDOUT_PER_FAMILY
+    positive coils. Before that it is re-carved each TRAIN (temporary, not comparable across versions)
+    so an early train is still evaluated without locking in a degenerate 0%-recall holdout.
     """
     if os.path.exists(HOLDOUT_FILE):
         h = modeling.load_artifact(HOLDOUT_FILE)
@@ -173,9 +161,9 @@ def write_model_version(version, n_train, threshold, metrics, trained_on):
 
 def run_retrain() -> dict:
     contract.assert_contract()
-    holdout, holdout_frozen = get_holdout()   # cold start: carve from the stream, freeze when representative
+    holdout, holdout_frozen = get_holdout()
     holdout_ids = set(holdout["coil_ids"])
-    X_hold, Y_hold = holdout["X"], holdout["Y"]    # holdout X already cleaned at carve time
+    X_hold, Y_hold = holdout["X"], holdout["Y"]    # already cleaned at carve time
 
     df = load_streamed(holdout_ids)
     if df.empty or len(df) < 1000:
@@ -191,9 +179,8 @@ def run_retrain() -> dict:
     fam_pos = {fam: int(Y_tr[:, j].sum()) for j, fam in enumerate(contract.LABELS)}
     log.info(f"retrain on {len(coils)} streamed coils / {len(X_tr)} train events; family positives = {fam_pos}")
 
-    # The whole allocate-train-publish sequence holds the cross-process advisory lock
-    # so concurrent publishers (the API path and a manual CLI run) serialize instead
-    # of minting the same version or racing the artifact files.
+    # hold the advisory lock across allocate-train-publish so a concurrent API+CLI run can't
+    # mint the same version or race the artifact files.
     lock_conn = _connect()
     try:
         with lock_conn.cursor() as cur:
@@ -218,13 +205,13 @@ def run_retrain() -> dict:
         artifact["metrics"] = metrics
         log.info(f"v{version} trained in {time.time()-t0:.1f}s; threshold {threshold:.2f}; held-out {metrics}")
 
-        # DB row first (upsert-safe), artifact last: the model.pkl mtime is the
-        # hot-swap trigger, so by the time the UDF reloads, the flywheel row exists.
+        # DB row first, artifact last: model.pkl mtime is the hot-swap trigger, so the
+        # model_versions row must exist before the UDF reloads.
         write_model_version(version, len(X_tr), threshold, metrics, artifact["trained_on"])
-        modeling.atomic_write_artifact(MODEL_DIR, artifact)      # hot-swap: TM reloads on mtime
+        modeling.atomic_write_artifact(MODEL_DIR, artifact)
         log.info(f"hot-swapped model -> v{version}")
     finally:
-        lock_conn.close()                     # session end releases the advisory lock
+        lock_conn.close()                     # close releases the advisory lock
 
     return {"version": version, "threshold": round(threshold, 3), "n_train": len(X_tr),
             "n_coils": int(len(coils)), "family_positives": fam_pos, "metrics": metrics}

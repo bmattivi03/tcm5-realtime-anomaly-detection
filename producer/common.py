@@ -15,8 +15,8 @@ def setup_topic(topic: str, bootstrap_servers: str = "localhost:29092", num_part
 
     last_ex = None
     for attempt in range(1, num_attempts + 1):
-        # bounded lookup + visible retry; without the timeout, list_topics() blocks
-        # forever on a dead broker and the retry loop never applies
+        # timeout is required: without it list_topics() blocks forever on a dead
+        # broker and the retry loop never runs
         try:
             t = client.list_topics(timeout=10).topics.get(topic)
         except KafkaException as ex:
@@ -33,8 +33,8 @@ def setup_topic(topic: str, bootstrap_servers: str = "localhost:29092", num_part
                 logging.info(f"Found existing topic '{topic}' with {np_} partitions, replication factor {rf}")
                 return False
             if not recreate_on_mismatch:
-                # deleting the topic throws away everything already streamed —
-                # never do that implicitly on a relaunch with different flags
+                # deleting the topic drops everything already streamed; never do
+                # it implicitly, require --recreate-topic
                 raise SystemExit(
                     f"Topic '{topic}' exists with {np_} partitions / rf {rf}, but "
                     f"{num_partitions}/{replication_factor} was requested. Refusing to "

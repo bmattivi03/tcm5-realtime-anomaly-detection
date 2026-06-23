@@ -1,6 +1,5 @@
-# Build context is the repo root so shared/contract.py + shared/modeling.py are COPYed in.
-# Same pinned numpy/scikit-learn as the Flink image, so the model it writes
-# loads cleanly in the UDF.
+# Build context is the repo root to COPY in shared/contract.py + shared/modeling.py.
+# numpy/scikit-learn pins must match the Flink image or the model pickle won't load in the UDF.
 FROM python:3.10-slim-bookworm
 WORKDIR /app
 COPY retrain/requirements.txt .

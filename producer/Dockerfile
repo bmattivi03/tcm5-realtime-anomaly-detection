@@ -1,4 +1,4 @@
-# Build context is the repo root so the single shared/contract.py is COPYed in.
+# build context is repo root so shared/contract.py is reachable
 FROM python:3.10-slim-bookworm
 WORKDIR /app
 COPY producer/requirements.txt .

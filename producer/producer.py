@@ -1,17 +1,10 @@
 #!/usr/bin/env python
-"""
-TCM-5 producer — replays the coil CSVs as a per-stand Kafka stream.
+"""TCM-5 producer: replays merged coils as a per-stand Kafka stream.
 
-Each coil (one CSV row) is unfolded into its 5 per-stand events (stand 1..5) using
-the shared contract, keyed by coil_id, with `ts_ms = now()` stamped at emission so
-Grafana "last N minutes" filters stay populated. The single input is the merged +
-shuffled source (data/tcm5_merged.parquet); if it is missing the producer builds it
-from the six raw CSVs with the shared merge, so every fault family is interleaved
-from the first minute.
-
-Pacing: --speedup is the approximate number of *coils* emitted per second (each coil
-= 5 events). A self-correcting rate limiter keeps the wall-clock spread realistic so
-the event-time windows fire repeatedly.
+One coil (CSV row) unfolds into 5 per-stand events keyed by coil_id, ts_ms stamped at
+emit so Grafana "last N minutes" stays populated. Input is the merged+shuffled source
+so every fault family is interleaved from the start; built from the raw CSVs if absent.
+--speedup is coils/s (1 coil = 5 events).
 """
 
 import os
@@ -45,8 +38,8 @@ def main():
     parser.add_argument("--topic", default=contract.TOPIC, type=str)
     parser.add_argument("--data-dir", default="data", type=str, help="directory with tcm5_dataset_*.csv")
     parser.add_argument("--data-file", default="", type=str,
-                        help="stream ONE merged CSV (scripts/merge_datasets.py output) in its "
-                             "shuffled row order instead of the numeric file sequence")
+                        help="stream ONE merged CSV in its shuffled row order instead of "
+                             "the numeric file sequence")
     parser.add_argument("--speedup", default=30.0, type=float, help="approx coils per second")
     parser.add_argument("--max-coils", default=0, type=int, help="stop after N coils (0 = all)")
     parser.add_argument("--loop", action="store_true",
@@ -68,13 +61,9 @@ def main():
 
     contract.assert_contract()
 
-    # The producer's single input is the merged + shuffled source: one file that
-    # interleaves every fault family from the first minute. It auto-detects the
-    # merged file in data-dir; if it is absent the producer BUILDS it from the six
-    # raw CSVs with the shared merge (seed 42) and writes it back, so the run is
-    # reproducible and the file is reused next time. It never streams the raw files
-    # in their reduction-first order.
-    preloaded = {}                                   # path -> in-memory frame (read-only data dir)
+    # auto-detect the merged file; build it from the raw CSVs (seed 42) and cache to
+    # disk if absent. never stream the raw files in their reduction-first order.
+    preloaded = {}                                   # path -> in-memory frame, used when data dir is read-only
     data_file = args.data_file
     if not data_file:
         parquet = os.path.join(args.data_dir, "tcm5_merged.parquet")
@@ -91,7 +80,7 @@ def main():
             try:
                 merged_df.to_parquet(parquet, index=False)
                 logging.info(f"Wrote {parquet}: {len(merged_df)} coils")
-            except OSError as e:                      # e.g. data dir mounted read-only
+            except OSError as e:                      # data dir mounted read-only
                 logging.warning(f"Could not write {parquet} ({e}); streaming the "
                                 f"merged data from memory")
                 preloaded[parquet] = merged_df
@@ -144,15 +133,14 @@ def main():
             df = preloaded.get(path)
             if df is None:
                 df = pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path)
-            # the merged source carries its own coil_id/file_no; stream it in the file's
-            # shuffled row order (NOT coil_id order, which would re-group by file).
+            # stream in the file's shuffled row order, NOT coil_id order (would re-group by file)
             frame = contract.build_per_stand_frame(df)
             n_coils = len(df)
             frame["__ord"] = np.tile(np.arange(n_coils), 5)
             frame = (frame.sort_values(["__ord", "stand"])
                           .reset_index(drop=True).drop(columns="__ord"))
 
-            # pull columns to numpy once for a fast, low-memory emit loop
+            # pull columns to numpy once for a low-memory emit loop
             arrs = {c: frame[c].to_numpy() for c in
                     (["coil_id", "file_no"] + event_feature_keys + label_keys)}
             n = len(frame)
@@ -161,7 +149,7 @@ def main():
             i = 0
             while i < n:
                 ts_ms = int(time.time() * 1000)
-                for j in range(5):                            # 5 stands of one coil (sorted)
+                for j in range(5):                            # 5 stands of one coil, share ts_ms
                     idx = i + j
                     ev = {k: arrs[k][idx] for k in event_feature_keys}
                     ev["coil_id"] = arrs["coil_id"][idx]
@@ -188,7 +176,8 @@ def main():
                     stop = True
                     break
 
-                # self-correcting rate limiter: keep coils_emitted ≈ speedup * elapsed
+                # self-correcting rate limit so wall-clock spread stays realistic and the
+                # event-time windows keep firing: keep coils_emitted ≈ speedup * elapsed
                 if args.speedup > 0:
                     expected = coils_emitted / args.speedup
                     behind = expected - (time.time() - start)
@@ -206,7 +195,7 @@ def main():
         while remaining > 0:
             logging.warning(f"flush: {remaining} messages still in queue, retrying...")
             prev, remaining = remaining, producer.flush(60.0)
-            if remaining >= prev:                       # no progress: broker is gone
+            if remaining >= prev:                       # no progress, broker is gone
                 break
         if remaining > 0 or delivery["failed"] > 0:
             logging.error(f"DELIVERY INCOMPLETE: {delivery['failed']} failed, "

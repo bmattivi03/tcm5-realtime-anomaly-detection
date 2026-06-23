@@ -1,24 +1,10 @@
-"""
-Vectorized Pandas scoring UDFs — executed on the Flink TaskManager.
+"""Vectorized pandas scoring UDFs, run on the Flink TaskManager.
 
-Five DOUBLE UDFs (anomaly_score + 4 family probabilities) plus an INT model_version
-UDF. All share ONE module-global model, loaded lazily and HOT-RELOADED when the
-artifact's mtime changes (the retrain sidecar writes a new /models/model.pkl
-atomically; we never restart the Flink job).
-
-Consistency: the model artifact is resolved ONCE per Arrow batch. _proba() memoizes
-(probabilities, model version) keyed by the batch CONTENT, and every UDF — including
-model_version — reads that memo, so all 6 output columns of a batch always come from
-the same artifact even if a hot reload lands mid-batch. (The memo is content-keyed,
-not id()-keyed: CPython reuses ids after GC, which would alias a later batch.)
-
-A reloaded artifact is validated against the contract (feature/label names + order)
-before it replaces the live one; a bad artifact is rejected loudly and the previous
-model keeps scoring — a corrupt retrain can never take down the running job.
-
-PyFlink 1.18 vectorized pandas UDFs return a single pandas.Series each (ROW returns
-are unsupported) — hence one UDF per output column. Varargs (*cols) keeps the call
-in lockstep with contract.FEATURES so the feature matrix is always in training order.
+One UDF per output column (PyFlink 1.18 pandas UDFs can't return a ROW). The model loads lazily and
+hot-reloads on mtime change, so a retrain swaps in with no job restart. The per-batch memo is keyed by
+batch content, not id() (CPython reuses ids after GC), so every column of a batch comes from one model
+resolution even if a hot reload lands mid-batch. A reloaded artifact is validated against the contract before replacing the live one; a bad
+one is rejected and the old model keeps scoring.
 """
 
 import os
@@ -37,11 +23,11 @@ N_FAMILIES = len(contract.LABELS)
 
 _lock = threading.Lock()
 _state = {"artifact": None, "mtime": None}              # cached model, keyed by file mtime
-_memo = {"key": None, "proba": None, "version": None}   # per-batch cache (content-keyed)
+_memo = {"key": None, "proba": None, "version": None}   # per-batch cache, content-keyed
 
 
 def _validate(art) -> bool:
-    """A model artifact is only accepted if its contract matches ours exactly."""
+    """accept an artifact only if its features/labels match the contract exactly."""
     return (isinstance(art, dict)
             and art.get("features") == contract.FEATURES
             and art.get("labels") == contract.LABELS
@@ -50,12 +36,12 @@ def _validate(art) -> bool:
 
 
 def _load():
-    """Return the cached artifact, reloading iff /models/model.pkl mtime changed.
-    Keeps the previous artifact if the new file is unreadable or contract-invalid."""
+    """cached artifact, reloaded only when mtime changes; keeps the old one if the new
+    file is unreadable or contract-invalid."""
     try:
         mtime = os.path.getmtime(MODEL_PATH)
     except OSError:
-        return _state["artifact"]               # not present yet (None on first calls)
+        return _state["artifact"]               # no model yet (None on first calls)
     if _state["mtime"] == mtime:
         return _state["artifact"]
     with _lock:
@@ -64,7 +50,7 @@ def _load():
         try:
             art = modeling.load_artifact(MODEL_PATH)
         except Exception as ex:                 # partial/corrupt file: keep serving old
-            # NOTE: PyFlink replaces the worker's print(); no flush= kwarg here.
+            # PyFlink replaces the worker's print(); no flush= kwarg accepted here.
             print(f"[model_udf] FAILED to load {MODEL_PATH}: {ex} — keeping current model")
             return _state["artifact"]
         if not _validate(art):
@@ -80,8 +66,8 @@ def _load():
 
 
 def _score_batch(cols):
-    """cols: list of 16 pandas.Series in FEATURES order. Ensures the memo holds this
-    batch's (proba matrix, model version), computed with ONE artifact resolution."""
+    """cols: 16 pandas.Series in FEATURES order. Fills the memo with this batch's
+    (proba matrix, version) from a single artifact resolution."""
     first = cols[0]
     key = (len(first), hash(tuple(np.asarray(c).tobytes() for c in cols)))
     if _memo["key"] == key and _memo["proba"] is not None:

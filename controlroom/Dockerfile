@@ -1,5 +1,5 @@
-# Build context is the repo root, like the other services.
-# Read-only view over Postgres + SSE fan-out; no ML deps needed here.
+# build context is the repo root (same as the other services)
+# read-only Postgres view + SSE fan-out, so no ML deps here
 FROM python:3.10-slim-bookworm
 WORKDIR /app
 COPY controlroom/requirements.txt .

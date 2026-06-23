@@ -1,26 +1,10 @@
 #!/usr/bin/env python
-"""
-FastAPI wrapper around the retrain core + the drift-triggered auto-retrain policy.
+"""FastAPI wrapper around the retrain core plus the drift-triggered auto-retrain policy.
 
-  GET  /          small HTML page with a "Retrain now" button (clickable from a
-                  Grafana dashboard link)
-  GET  /health    liveness
-  POST /retrain   train on streamed data, hot-swap the model, return {version, metrics}
-  GET  /versions  the model_versions history (JSON, properly typed)
-  GET  /policy    the auto-retrain policy state (enabled, last check, last reason)
-  POST /policy/enable | /policy/disable
-
-A single-flight lock makes concurrent retrains safe (the API returns 409 while one
-runs; the policy thread just skips its tick).
-
-The policy closes the MLOps loop: every POLICY_CHECK_S it measures LIVE per-family
-recall over the last few minutes of streamed, labeled events (prediction =
-anomaly_score >= the live model's threshold, truth = the y_* labels the producer
-carries). When a family with enough positives in the window falls below the recall
-floor — exactly what happens when files 3-6 introduce fault families the v1
-bootstrap never saw — it fires retrain.run_retrain() automatically and the new model
-hot-swaps into the running Flink job. Monitor -> detect drift -> retrain -> hot-swap,
-no human in the loop (the button still works for manual runs).
+Single-flight lock guards concurrent retrains: the API returns 409 while one runs, the
+policy thread skips its tick. The policy measures live per-family recall over a window of
+streamed labeled events and fires a retrain when a family with enough positives drops below
+the recall floor; the new model hot-swaps into the running Flink job.
 """
 
 import os
@@ -56,7 +40,7 @@ _policy_state = {
 
 
 def _policy_tick():
-    """One drift check. Returns the reason string (also stored in the state)."""
+    """One drift check; returns the reason string."""
     conn = retrain._connect()
     try:
         with conn.cursor() as cur:
@@ -80,7 +64,7 @@ def _policy_tick():
             if since_train_s < POLICY["min_interval_s"]:
                 return f"current model is only {since_train_s:.0f}s old"
 
-            # live per-family recall over the last window of STREAM time
+            # per-family recall over the last window of STREAM time, not wall-clock
             cur.execute(f"""
                 WITH w AS (
                   SELECT anomaly_score, y_electric, y_bearing, y_workroll, y_reduction
@@ -213,7 +197,7 @@ def do_retrain():
     try:
         return retrain.run_retrain()
     except RuntimeError as ex:
-        # expected preconditions (no holdout yet / not enough streamed data)
+        # precondition not met (no holdout yet / not enough streamed data) -> 409, not 500
         log.warning(f"retrain precondition failed: {ex}")
         raise HTTPException(status_code=409, detail=str(ex))
     except Exception as ex:

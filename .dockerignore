@@ -1,4 +1,4 @@
-# Keep the build context small. Data is bind-mounted at runtime, not copied into images.
+# data/ is bind-mounted at runtime, not copied into images
 data/
 .git/
 .gitignore

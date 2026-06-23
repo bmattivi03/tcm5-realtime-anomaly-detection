@@ -1,8 +1,5 @@
-/* ════════════════════════════════════════════════════════════════════════
-   TCM-5 mill control room — steel-pulpit SCADA skin.
-   Shares the sidecar palette (#0b0e14 / #161b22 / #2f81f7) so the two feel
-   like one product; condensed display type + tabular monospace data.
-   ════════════════════════════════════════════════════════════════════════ */
+/* TCM-5 control room styles.
+   Palette (#0b0e14 / #161b22 / #2f81f7) kept in sync with the sidecar. */
 
 :root {
   --bg:        #0b0e14;
@@ -46,7 +43,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* faint CRT scanlines + vignette over everything, dirt cheap */
+/* CRT scanlines + vignette overlay */
 body::after {
   content: "";
   position: fixed; inset: 0;
@@ -66,7 +63,7 @@ body::after {
 
 .num { font-variant-numeric: tabular-nums; }
 
-/* ── panels: bordered cards with machined corner brackets + ID tag ─────── */
+/* ── panels: bordered cards with corner brackets + id tag ──────────────── */
 .panel {
   position: relative;
   background: linear-gradient(180deg, #121821 0%, #0e131b 100%);
@@ -80,7 +77,7 @@ body::after {
 .panel::before { top: -1px; left: -1px; border-right: 0; border-bottom: 0; }
 .panel::after  { bottom: -1px; right: -1px; border-left: 0; border-top: 0; }
 
-/* engraved panel id, top-right (replaces the bottom-right bracket) */
+/* panel id, top-right; replaces the bottom-right bracket */
 .panel[data-pid]:not(.masthead)::after {
   content: attr(data-pid);
   width: auto; height: auto; border: 0;
@@ -95,7 +92,7 @@ body::after {
   gap: 16px;
   border-bottom: 1px solid var(--line);
   padding-bottom: 8px; margin-bottom: 10px;
-  padding-right: 110px;             /* clear the engraved id */
+  padding-right: 110px;             /* clear the id tag */
 }
 .ph-title {
   font-family: var(--display);

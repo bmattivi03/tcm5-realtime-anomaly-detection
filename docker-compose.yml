@@ -1,15 +1,6 @@
-#
-# TCM-5 real-time anomaly detection — full stack.
-#
-#   `docker compose up -d` starts the whole pipeline (.env sets COMPOSE_PROFILES=processor,producer):
-#     broker (Kafka KRaft) · kafka-ui · postgres · grafana · flink JM+TM · retrain ·
-#     controlroom · processor (submits the PyFlink job) · producer (replays coils to Kafka)
-#   `docker compose down`     stops it (state kept in named volumes)
-#   `docker compose down -v`  stops AND erases all data + the trained model (true cold start next up)
-#
-# Python services (processor/retrain/producer) build with context '.' so the
-# single data contract shared/contract.py is COPYed into each image.
-#
+# TCM-5 real-time anomaly detection stack. .env sets COMPOSE_PROFILES=processor,producer
+# so a plain `up` starts everything; `down -v` also wipes data + trained model.
+# Python services build with context '.' so shared/contract.py gets COPYed into each image.
 
 services:
 
@@ -92,11 +83,7 @@ services:
       DB_USERID: '${USERID:-user}'
       DB_USERPWD: '${USERPWD:-user}'
 
-  #
-  # Flink cluster: one JobManager + one TaskManager. The PyFlink UDF executes on the
-  # TaskManager, so the model artifact volume is mounted there (read) and into the
-  # retrain service (write).
-  #
+  # UDF runs on the TaskManager, so models volume is mounted there (read) and on retrain (write).
   flink-jobmanager:
     build:
       context: .
@@ -126,7 +113,7 @@ services:
       - flink-jobmanager
     command: taskmanager
     volumes:
-      - models-data:/models                    # UDF reads /models/model.pkl here
+      - models-data:/models
     environment:
       MODEL_PATH: '/models/model.pkl'
       MODEL_META_PATH: '/models/model.meta'
@@ -136,9 +123,7 @@ services:
         parallelism.default: ${FLINK_DEFAULT_PARALLELISM:-1}
         taskmanager.memory.process.size: 2560m
 
-  #
-  # PyFlink processor submission container. Submits the job to the Flink cluster.
-  #
+  # Submits the PyFlink job to the Flink cluster.
   processor:
     build:
       context: .
@@ -152,9 +137,8 @@ services:
       - flink-jobmanager
       - broker
       - postgres
-    # models mounted read-only for a presence check: on cold start the submitter
-    # launches immediately with no model (events persist unscored until Train);
-    # set REQUIRE_MODEL=1 to instead block until an artifact exists.
+    # ro mount is a presence check only: cold start submits with no model (events persist
+    # unscored until Train). REQUIRE_MODEL=1 blocks until an artifact exists instead.
     volumes:
       - models-data:/models:ro
     environment:
@@ -162,9 +146,7 @@ services:
       PROCESSOR_IMPLEMENTATION: 'processor.py'
       PROCESSOR_ARGS: '--bootstrap-servers broker:9092 --topic ${TOPIC:-tcm5_readings} --db-url jdbc:postgresql://postgres:5432/db --db-username ${USERID:-user} --db-password ${USERPWD:-user} --threshold ${KPI_THRESHOLD:-0.85}'
 
-  #
-  # Producer: replays the coils as a per-stand Kafka stream.
-  #
+  # Replays coils as a per-stand Kafka stream.
   producer:
     build:
       context: .
@@ -175,8 +157,7 @@ services:
     depends_on:
       - broker
     volumes:
-      # read-write so the producer can materialize data/tcm5_merged.parquet on a
-      # clean checkout where only the raw CSVs are present
+      # rw so producer can materialize data/tcm5_merged.parquet from raw CSVs on a clean checkout
       - ./data:/data
     command: >
       python3 producer.py
@@ -187,10 +168,7 @@ services:
       --max-coils ${PRODUCER_MAX_COILS:-0}
       ${PRODUCER_EXTRA:-}
 
-  #
-  # Retrain sidecar (FastAPI). Always up; POST /retrain trains on streamed data,
-  # evaluates on the fixed held-out set, hot-swaps the model artifact atomically.
-  #
+  # POST /retrain trains on streamed data and atomically hot-swaps the model artifact.
   retrain:
     build:
       context: .
@@ -210,10 +188,7 @@ services:
       MODEL_DIR: '/models'
       RETRAIN_AUTO: '${RETRAIN_AUTO:-1}'
 
-  #
-  # Control room (FastAPI + SSE). Read-only live "mill control room" web UI on top of
-  # Postgres — the operational complement to the one analytical Grafana dashboard.
-  #
+  # Live operational web UI over Postgres; complements the analytical Grafana dashboard.
   controlroom:
     build:
       context: .

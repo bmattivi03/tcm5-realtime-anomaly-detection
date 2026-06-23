@@ -39,7 +39,7 @@ docker compose up -d --build
 
 | service | URL | notes |
 |---|---|---|
-| Control room | http://localhost:38500 | live animated mill, alarm ticker, hot-swap choreography, TRAIN button |
+| Control room | http://localhost:38500 | live animated mill, alarm ticker, hot-swap banner, TRAIN button |
 | Grafana | http://localhost:33000 | login `user` / `user`; the TCM-5 dashboard is the home page |
 | Flink UI | http://localhost:38081 | running job, checkpoints, watermarks, backpressure |
 | Kafka UI | http://localhost:38080 | the `tcm5_readings` topic and consumer-group lag |
@@ -61,8 +61,9 @@ PRODUCER_EXTRA=--loop docker compose up -d producer
 ```
 
 After a code change, rebuild and restart with `docker compose up -d --build`. For a processor/UDF change
-specifically, use `./scripts/processor-submit.sh` so the old Flink job is cancelled before the new one
-is submitted (a plain `up --build` would leave both running and double-count).
+specifically, cancel the running job first (in the Flink UI, or with `docker compose down`) before
+bringing the stack back up: removing the `processor` container alone does not cancel the Flink job, and
+two jobs would consume the topic in parallel and double-count.
 
 ---
 
@@ -82,8 +83,9 @@ is submitted (a plain `up --build` would leave both running and double-count).
    a model exists.
 4. **It is measurably real-time.** The **End-to-end latency** panel charts p50/p95 of `ingested_at - ts`
    (producer emission → Kafka → Flink scoring → JDBC sink → Postgres): about 0.5 s p50 in steady state.
-   `./scripts/demo_backpressure.sh surge` overloads the pipeline 10x — watch p95 climb, consumer lag
-   build in Kafka UI and the Flink busy gauges light up, then `drain` and watch it recover.
+   Relaunching the producer at 10x (`PRODUCER_SPEEDUP=300 docker compose up -d producer`) overloads the
+   pipeline — watch p95 climb, consumer lag build in Kafka UI and the Flink busy gauges light up, then
+   restore the pace (`PRODUCER_SPEEDUP=30 docker compose up -d producer`) and watch it recover.
 5. **It survives failure.** Checkpointing runs every 10 s (exactly-once mode) with a fixed-delay restart
    strategy: `docker compose restart flink-taskmanager` mid-stream and the job auto-recovers from the
    last checkpoint and keeps counting — the readers' dedup conventions absorb the at-least-once replay.
@@ -115,7 +117,7 @@ charted as time-series.
 http://localhost:38500 — a buildless FastAPI + SSE + RxJS single page (vendored RxJS, no build step):
 an animated SVG schematic of the 5-stand mill whose strip speed tracks live events/s, per-stand alarm
 lamps with dominant-fault labels and roll-wear rings, a live anomaly ticker with per-coil drill-down,
-throughput/freshness/latency vitals, the hot-swap banner choreography, and a retrain button. One
+throughput/freshness/latency vitals, the hot-swap banner, and a retrain button. One
 background task polls Postgres once per second and fans the same snapshot to every connected browser
 (server-sent events, O(1) DB load in the number of viewers). Grafana remains the single analytical
 dashboard; this is the live operational complement.
@@ -128,14 +130,12 @@ dashboard; this is the live operational complement.
 |---|---|
 | `shared/contract.py` | **the one data contract** — `FEATURES` (16, fixed order), `LABELS` (4), the per-stand unfold, the `coil_id` scheme. Imported by every component. |
 | `shared/modeling.py` | shared train / predict / threshold / NaN-policy / atomic-write logic, plus the cross-process publish lock key (one source of truth). |
-| `producer/` | replays the CSVs, unfolding each coil into 5 per-stand JSON events keyed by `coil_id`, `ts=now()` at emission, paced by `--speedup` (≈ coils/sec), `--loop` to replay continuously. Delivery callbacks and a verified flush mean message loss cannot pass silently. |
-| `scripts/merge_datasets.py` | merges the 6 CSVs and randomly shuffles them into a single `data/tcm5_merged.parquet` (keeping `coil_id`/`file_no` per row). The producer auto-detects this file and rebuilds it from the 6 raw CSVs if it is missing, so running this by hand is optional. |
+| `producer/` | merges the 6 CSVs into one randomly-shuffled source (`data/tcm5_merged.parquet`, keeping `coil_id`/`file_no` per row; rebuilt automatically from the raw CSVs if absent) and replays it, unfolding each coil into 5 per-stand JSON events keyed by `coil_id`, `ts=now()` at emission, paced by `--speedup` (≈ coils/sec), `--loop` to replay continuously. Delivery callbacks and a verified flush mean message loss cannot pass silently. |
 | `processor/` | the PyFlink job: Kafka source (event-time, earliest-offset, idle-timeout), vectorized pandas UDFs scoring each event ONCE (shared sub-plan via `table.optimizer.reuse-optimize-block-with-digest-enabled`), 10 s exactly-once checkpoints + fixed-delay restart, NULL-event guards, two sinks (`scored_events` + `kpi_windows`) in one StatementSet. Cold-start: submits with no model (events persist unscored until the first TRAIN); `REQUIRE_MODEL=1` restores block-until-model behaviour. |
 | `retrain/` | FastAPI sidecar: the **drift policy** (live per-family recall watcher, `GET /policy`) plus manual `POST /retrain`; trains on streamed `scored_events` (held-out excluded), evaluates on the fixed held-out set, publishes under a Postgres advisory lock (DB row first, artifact last, atomic). |
 | `controlroom/` | the live mill control-room web UI: FastAPI + SSE snapshot bus + buildless RxJS front-end (read-only on Postgres). |
 | `postgres/init.sql` | sink schema: `scored_events` (features + scores + labels + `ingested_at` for true e2e latency), **RANGE-partitioned on `ts` by day** with a DEFAULT catch-all; `kpi_windows`, `model_versions`; dedup-supporting indexes. |
 | `grafana/` | provisioned Postgres datasource + the single `tcm5.json` dashboard. |
-| `scripts/` | `reset.sh` (clean slate), `processor-submit.sh` (safe re-submit: rebuilds images, cancels + waits), `demo_backpressure.sh` (surge/drain), `partitions.sh` (list / retention). |
 
 **The model**: one `HistGradientBoostingClassifier` per fault family (class-balanced sample weights),
 bundled in a plain dict; `anomaly_score = max` of the four family probabilities. Identical
@@ -149,10 +149,10 @@ model keeps scoring.
 ## Operational notes
 
 - **Re-submitting the processor:** removing the `processor` *container* does not cancel the Flink *job*.
-  Use `./scripts/processor-submit.sh` — it rebuilds the images (the Flink image bakes
-  `shared/contract.py`, `shared/modeling.py` and `model_udf.py` onto the worker import path, so code
-  edits need a rebuild), cancels any running job and **waits for the cancellation to complete** before
-  resubmitting.
+  After a code change, rebuild the images (the Flink image bakes `shared/contract.py`,
+  `shared/modeling.py` and `model_udf.py` onto the worker import path, so code edits need a rebuild) and
+  cancel any running job — in the Flink UI, or with `docker compose down` — before bringing the stack back
+  up, otherwise two jobs run in parallel and double-count.
 - **Delivery semantics:** the per-event sink is append-only at-least-once; readers dedup with
   `DISTINCT ON (coil_id, stand) ... ORDER BY reading_id DESC` (index-assisted). The window sink upserts
   on its `(window_start, window_end)` key, so replays are idempotent. Checkpoints commit Kafka offsets
@@ -165,13 +165,13 @@ model keeps scoring.
 - **Auto-retrain tuning:** `RETRAIN_AUTO=0` disables the drift policy (button-only retrains); the floor,
   window, and minimum interval are env-tunable (see `retrain/app.py`).
 - **Time-partitioned fact table:** `scored_events` is RANGE-partitioned on `ts` (one partition per day,
-  plus a DEFAULT catch-all so an insert never fails). `./scripts/partitions.sh list` shows the
-  partitions; `./scripts/partitions.sh maintain [keep_days]` extends the forward window and drops
-  partitions past the horizon. Because `init.sql` only runs on a fresh data directory, picking up a
-  schema change needs `docker compose down -v` followed by re-submitting the processor and producer.
-- **Reset without a full restart** (keep the containers up): `./scripts/reset.sh --cold` cancels the job,
-  truncates the tables and model registry, deletes the topic and clears the model volume; plain
-  `./scripts/reset.sh` keeps the model for a re-stream with scoring live.
+  plus a DEFAULT catch-all so an insert never fails), so time-range dashboard queries prune to the
+  relevant day(s) and old data can be dropped a whole partition at a time instead of with a slow bulk
+  delete. Because `init.sql` only runs on a fresh data directory, picking up a schema change needs
+  `docker compose down -v` followed by bringing the stack back up.
+- **Clean slate:** `docker compose down -v` wipes the data, the Kafka topic and the trained model, so the
+  next `docker compose up -d --build` is a true cold start (no model until the first TRAIN). Plain
+  `docker compose down` (no `-v`) keeps everything in the named volumes and resumes on the next up.
 
 ---
 

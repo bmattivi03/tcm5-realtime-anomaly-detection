@@ -1,8 +1,5 @@
-/* ════════════════════════════════════════════════════════════════════════
-   TCM-5 control room client.
-   Buildless: vendored RxJS UMD (global `rxjs`) + this file, nothing else.
-   One SSE stream (/stream, event "snapshot") drives the whole board.
-   ════════════════════════════════════════════════════════════════════════ */
+/* TCM-5 control room client. Vendored RxJS UMD (global `rxjs`) + this file, no build step.
+   One SSE stream (/stream, event "snapshot") drives the whole board. */
 "use strict";
 
 const { Observable, from, fromEvent, of, timer } = rxjs;
@@ -15,10 +12,8 @@ const WEAR_FULL_KM = 120;        // observed work-roll mileage saw-tooths 0..120
 const NOMINAL_EPS = 1500;        // full-speed reference for the animations
 const IDLE_AFTER_S = 8;          // sink freshness beyond this => IDLE
 
-/* ───────────────────────── 1 · build the mill schematic ─────────────────
-   Parametric inline SVG: pay-off reel, 5 stand housings (work + backup roll
-   pairs), thinning strip path, tension reel. Generated here so the geometry
-   lives in one place. */
+/* --- 1 · mill schematic --- generated inline SVG: pay-off reel, 5 stand
+   housings (work + backup roll pairs), thinning strip, tension reel. */
 
 const STAND_X = [272, 440, 608, 776, 944];
 const STRIP_Y = 154;
@@ -98,7 +93,7 @@ function stripSvg() {
     rolls.push({ el, cx: +el.dataset.cx, cy: +el.dataset.cy, dir: +el.dataset.dir, k: +el.dataset.k }));
 })();
 
-/* ───────────────────────── 2 · the snapshot stream ─────────────────────── */
+/* --- 2 · snapshot stream --- */
 
 function fromSSE(url, name) {
   return new Observable((sub) => {
@@ -114,7 +109,7 @@ const snap$ = fromSSE("/stream", "snapshot").pipe(share());
 let lastSnap = null;       // latest snapshot, for drill-downs and the rAF engine
 let epsTarget = 0;         // animation speed target (0 when idle)
 
-/* ───────────────────────── 3 · header vitals + stands ──────────────────── */
+/* --- 3 · header vitals + stands --- */
 
 const fmtAge = (s) => (s < 1 ? "now" : s < 60 ? `${Math.round(s)}s` : s < 3600 ? `${Math.round(s / 60)}m` : `${Math.round(s / 3600)}h`);
 
@@ -172,10 +167,9 @@ function renderStands(s) {
 
 snap$.subscribe((s) => { lastSnap = s; renderVitals(s); renderStands(s); });
 
-/* ───────────────────────── 4 · model banner + hot-swap ──────────────────
-   latest.version comes from the model register the moment a retrain lands;
-   live_version is max(model_version) in the last 10 s of scored rows. The
-   gap between them IS the in-flight hot-reload inside Flink. */
+/* --- 4 · model banner + hot-swap --- latest.version = registered version;
+   live_version = max(model_version) over scored rows in the last 10 s. A gap
+   (latest > live) means the Flink UDF hot-reload is still in flight. */
 
 const kfmt = (txt) => String(txt).replace(/\d{4,}/g, (n) => Math.round(+n / 1000) + "K");
 
@@ -224,7 +218,7 @@ snap$.pipe(
   if (phase === "flash") flashTimer = setTimeout(() => setSwapUI("sync", live, latest), 4500);
 });
 
-/* recall bars: tween on version change, ghost tick = previous version */
+/* recall bars: ghost tick marks the previous version */
 snap$.pipe(
   map((s) => s.model),
   filter((m) => !!m.latest),
@@ -252,8 +246,7 @@ snap$.pipe(
   });
 });
 
-/* ───────────────────────── 5 · anomaly ticker ───────────────────────────
-   Diff on reading_id with scan; new entries slide in, oldest are trimmed. */
+/* --- 5 · anomaly ticker --- diff on reading_id to find new rows; oldest trimmed. */
 
 const tickerEl = $("ticker");
 
@@ -296,8 +289,7 @@ snap$.pipe(
   updateAges(anchor);
 });
 
-/* click a row → inline mini-profile of that coil across the 5 stands */
-/* shared by the ticker and the inspection table: fetch a coil's per-stand profile */
+/* per-stand profile for one coil; shared by the ticker and the inspection table */
 async function coilProfileHTML(coil) {
   const r = await fetch(`/api/coil/${coil}`);
   const j = await r.json();
@@ -334,9 +326,8 @@ tickerEl.addEventListener("click", async (ev) => {
   catch (e) { li.querySelector(".p-err").textContent = "fetch failed: " + e.message; }
 });
 
-/* ───────────────────────── 5b · coils-to-inspect table ──────────────────
-   Full flagged list (not just the streaming ticker): predicted fault per coil,
-   sortable headers, click a row to drill into the same per-stand profile. */
+/* --- 5b · coils-to-inspect table --- full flagged list (not just the ticker):
+   predicted fault per coil, sortable headers, click to drill into the profile. */
 
 const inspectBody = $("inspect-body");
 let inspectSort = { k: "confidence", dir: -1 };
@@ -413,7 +404,7 @@ inspectBody.addEventListener("click", async (ev) => {
   catch (e) { detail.innerHTML = `<div class="p-err">fetch failed: ${e.message}</div>`; }
 });
 
-/* ───────────────────────── 6 · retrain button + policy line ─────────────── */
+/* --- 6 · retrain button + policy line --- */
 
 const rbtn = $("retrain-btn"), rstatus = $("retrain-status"), rout = $("retrain-out");
 
@@ -458,9 +449,8 @@ timer(0, 30000).pipe(
     (why ? ` · ${String(why).slice(0, 60)}` : "");
 });
 
-/* ───────────────────────── 7 · rAF engine ───────────────────────────────
-   One loop: throughput odometer easing, strip flow, roll rotation.
-   Speed is proportional to live events/s and eases to a stop when idle. */
+/* --- 7 · rAF engine --- one loop drives the odometer, strip flow and roll spin;
+   speed tracks live events/s and eases to a stop when idle. */
 
 const flows = document.querySelectorAll("#mill .strip-flow");
 let epsDisp = 0, flowOffset = 0, rollAngle = 0, tPrev = performance.now();
